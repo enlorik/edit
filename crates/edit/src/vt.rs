@@ -344,3 +344,112 @@ impl<'input> Stream<'_, 'input> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    enum Kind {
+        Osc,
+        Dcs,
+    }
+
+    // Feeds `chunks` through a single `Parser` one at a time (simulating a
+    // stream split across reads) and reconstructs the OSC/DCS payload,
+    // asserting that every token produced belongs to the same `Kind`.
+    fn parse_chunks(chunks: &[&str]) -> (Kind, String) {
+        let mut parser = Parser::new();
+        let mut kind = None;
+        let mut data = String::new();
+
+        for chunk in chunks {
+            let mut stream = parser.parse(chunk);
+            while let Some(tok) = stream.next() {
+                match tok {
+                    Token::Osc { data: d, .. } => {
+                        assert!(
+                            !matches!(kind, Some(Kind::Dcs)),
+                            "OSC/DCS labeling was inconsistent across chunks"
+                        );
+                        kind = Some(Kind::Osc);
+                        data.push_str(d);
+                    }
+                    Token::Dcs { data: d, .. } => {
+                        assert!(
+                            !matches!(kind, Some(Kind::Osc)),
+                            "OSC/DCS labeling was inconsistent across chunks"
+                        );
+                        kind = Some(Kind::Dcs);
+                        data.push_str(d);
+                    }
+                    _ => panic!("unexpected token"),
+                }
+            }
+        }
+
+        (kind.expect("no OSC/DCS token was produced"), data)
+    }
+
+    // Regression test: `self.parser.state` used to be read after the inner
+    // loop had already advanced it from `Osc` to `OscEsc` (because the chunk
+    // boundary landed right on the ST-terminator's closing ESC). The match
+    // only special-cased `State::Osc` explicitly, so `OscEsc` fell into the
+    // `_ => Dcs` wildcard and the sequence was mislabeled as a DCS token.
+    #[test]
+    fn osc_split_at_terminator_esc_is_labeled_osc() {
+        let (kind, data) = parse_chunks(&["\x1b]0;hello\x1b", "\\"]);
+        assert!(matches!(kind, Kind::Osc));
+        assert_eq!(data, "0;hello");
+    }
+
+    // Control case: the identical split point on a DCS sequence happens to
+    // land on the same wildcard arm and must keep working unchanged.
+    #[test]
+    fn dcs_split_at_terminator_esc_is_labeled_dcs() {
+        let (kind, data) = parse_chunks(&["\x1bP0;hello\x1b", "\\"]);
+        assert!(matches!(kind, Kind::Dcs));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn osc_split_at_opening_esc() {
+        let (kind, data) = parse_chunks(&["\x1b", "]0;hello\x1b\\"]);
+        assert!(matches!(kind, Kind::Osc));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn dcs_split_at_opening_esc() {
+        let (kind, data) = parse_chunks(&["\x1b", "P0;hello\x1b\\"]);
+        assert!(matches!(kind, Kind::Dcs));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn osc_split_at_selector_byte() {
+        let (kind, data) = parse_chunks(&["\x1b]", "0;hello\x1b\\"]);
+        assert!(matches!(kind, Kind::Osc));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn dcs_split_at_selector_byte() {
+        let (kind, data) = parse_chunks(&["\x1bP", "0;hello\x1b\\"]);
+        assert!(matches!(kind, Kind::Dcs));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn osc_split_mid_payload() {
+        let (kind, data) = parse_chunks(&["\x1b]0;he", "llo\x1b\\"]);
+        assert!(matches!(kind, Kind::Osc));
+        assert_eq!(data, "0;hello");
+    }
+
+    #[test]
+    fn dcs_split_mid_payload() {
+        let (kind, data) = parse_chunks(&["\x1bP0;he", "llo\x1b\\"]);
+        assert!(matches!(kind, Kind::Dcs));
+        assert_eq!(data, "0;hello");
+    }
+}
