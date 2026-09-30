@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use std::ptr;
+#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::helpers::CoordType;
 
@@ -35,7 +37,14 @@ unsafe fn lines_bwd_raw(
     line_stop: CoordType,
 ) -> (*const u8, CoordType) {
     #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-    return unsafe { LINES_BWD_DISPATCH(beg, end, line, line_stop) };
+    {
+        let func = LINES_BWD_DISPATCH.load(Ordering::Relaxed);
+        // SAFETY: `LINES_BWD_DISPATCH` only ever holds a `LinesBwdDispatchFn`
+        // cast to `*mut ()` -- either its own initial resolver or one of the
+        // concrete SIMD/fallback implementations `lines_bwd_dispatch` sets it to.
+        let func: LinesBwdDispatchFn = unsafe { std::mem::transmute(func) };
+        return unsafe { func(beg, end, line, line_stop) };
+    }
 
     #[cfg(target_arch = "aarch64")]
     return unsafe { lines_bwd_neon(beg, end, line, line_stop) };
@@ -66,12 +75,15 @@ unsafe fn lines_bwd_fallback(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-static mut LINES_BWD_DISPATCH: unsafe fn(
+type LinesBwdDispatchFn = unsafe fn(
     beg: *const u8,
     end: *const u8,
     line: CoordType,
     line_stop: CoordType,
-) -> (*const u8, CoordType) = lines_bwd_dispatch;
+) -> (*const u8, CoordType);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+static LINES_BWD_DISPATCH: AtomicPtr<()> = AtomicPtr::new(lines_bwd_dispatch as *mut ());
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn lines_bwd_dispatch(
@@ -81,7 +93,7 @@ unsafe fn lines_bwd_dispatch(
     line_stop: CoordType,
 ) -> (*const u8, CoordType) {
     let func = if is_x86_feature_detected!("avx2") { lines_bwd_avx2 } else { lines_bwd_fallback };
-    unsafe { LINES_BWD_DISPATCH = func };
+    LINES_BWD_DISPATCH.store(func as *mut (), Ordering::Relaxed);
     unsafe { func(beg, end, line, line_stop) }
 }
 
@@ -178,7 +190,7 @@ unsafe fn lines_bwd_dispatch(
     } else {
         lines_bwd_fallback
     };
-    unsafe { LINES_BWD_DISPATCH = func };
+    LINES_BWD_DISPATCH.store(func as *mut (), Ordering::Relaxed);
     unsafe { func(beg, end, line, line_stop) }
 }
 
@@ -447,5 +459,39 @@ mod test {
             assert_eq!(off, 6); // After "Hello\n"
             assert_eq!(line, 123); // Still on the same line
         }
+    }
+
+    /// `LINES_BWD_DISPATCH` is resolved once, on first use, by an
+    /// unsynchronized write, and read on every call thereafter. If many
+    /// threads call `lines_bwd` for the first time at once, they race to
+    /// resolve and read that dispatch pointer concurrently.
+    ///
+    /// The assertions in this test will pass either way -- resolution
+    /// always converges on a valid function pointer for the process's CPU,
+    /// so the race by itself doesn't produce a wrong *result*. A plain
+    /// `cargo test` run of this is therefore not meaningful proof of
+    /// anything. What actually catches the bug is running it under Miri
+    /// (`cargo +nightly miri test`), which instruments every memory access
+    /// and reports "Undefined Behavior: Data race detected" at the
+    /// unsynchronized read/write sites on the unpatched code.
+    #[test]
+    fn dispatch_resolution_is_race_free() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 200;
+        let barrier = Barrier::new(THREADS);
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let (off, line) = lines_bwd(b"Hello\nWorld\n", 11, 123, 456);
+                    assert_eq!(off, 6);
+                    assert_eq!(line, 123);
+                });
+            }
+        });
     }
 }
