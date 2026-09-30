@@ -515,9 +515,9 @@ impl<'input> Stream<'_, '_, 'input> {
             return None;
         }
 
-        let b = self.parser.x10_mouse_buf[0] as u16 - 0x20;
-        let x = self.parser.x10_mouse_buf[1] as u16 - 0x20;
-        let y = self.parser.x10_mouse_buf[2] as u16 - 0x20;
+        let b = (self.parser.x10_mouse_buf[0] as u16).saturating_sub(0x20);
+        let x = (self.parser.x10_mouse_buf[1] as u16).saturating_sub(0x20);
+        let y = (self.parser.x10_mouse_buf[2] as u16).saturating_sub(0x20);
 
         self.parser.x10_mouse_want = false;
         self.parser.x10_mouse_len = 0;
