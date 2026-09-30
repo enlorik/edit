@@ -259,6 +259,7 @@ impl<'input> Stream<'_, 'input> {
                 }
                 State::Osc | State::Dcs => {
                     let beg = self.off;
+                    let state = self.parser.state;
                     let mut data;
                     let mut partial;
 
@@ -300,7 +301,6 @@ impl<'input> Stream<'_, 'input> {
                         break;
                     }
 
-                    let state = self.parser.state;
                     if !partial {
                         self.parser.state = State::Ground;
                     }
