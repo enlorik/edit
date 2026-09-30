@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use std::ptr;
+#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::helpers::CoordType;
 
@@ -35,7 +37,14 @@ unsafe fn lines_bwd_raw(
     line_stop: CoordType,
 ) -> (*const u8, CoordType) {
     #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-    return unsafe { LINES_BWD_DISPATCH(beg, end, line, line_stop) };
+    {
+        let func = LINES_BWD_DISPATCH.load(Ordering::Relaxed);
+        // SAFETY: `LINES_BWD_DISPATCH` only ever holds a `LinesBwdDispatchFn`
+        // cast to `*mut ()` -- either its own initial resolver or one of the
+        // concrete SIMD/fallback implementations `lines_bwd_dispatch` sets it to.
+        let func: LinesBwdDispatchFn = unsafe { std::mem::transmute(func) };
+        return unsafe { func(beg, end, line, line_stop) };
+    }
 
     #[cfg(target_arch = "aarch64")]
     return unsafe { lines_bwd_neon(beg, end, line, line_stop) };
@@ -66,12 +75,15 @@ unsafe fn lines_bwd_fallback(
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
-static mut LINES_BWD_DISPATCH: unsafe fn(
+type LinesBwdDispatchFn = unsafe fn(
     beg: *const u8,
     end: *const u8,
     line: CoordType,
     line_stop: CoordType,
-) -> (*const u8, CoordType) = lines_bwd_dispatch;
+) -> (*const u8, CoordType);
+
+#[cfg(any(target_arch = "x86_64", target_arch = "loongarch64"))]
+static LINES_BWD_DISPATCH: AtomicPtr<()> = AtomicPtr::new(lines_bwd_dispatch as *mut ());
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn lines_bwd_dispatch(
@@ -81,7 +93,7 @@ unsafe fn lines_bwd_dispatch(
     line_stop: CoordType,
 ) -> (*const u8, CoordType) {
     let func = if is_x86_feature_detected!("avx2") { lines_bwd_avx2 } else { lines_bwd_fallback };
-    unsafe { LINES_BWD_DISPATCH = func };
+    LINES_BWD_DISPATCH.store(func as *mut (), Ordering::Relaxed);
     unsafe { func(beg, end, line, line_stop) }
 }
 
@@ -178,7 +190,7 @@ unsafe fn lines_bwd_dispatch(
     } else {
         lines_bwd_fallback
     };
-    unsafe { LINES_BWD_DISPATCH = func };
+    LINES_BWD_DISPATCH.store(func as *mut (), Ordering::Relaxed);
     unsafe { func(beg, end, line, line_stop) }
 }
 
