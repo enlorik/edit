@@ -591,3 +591,101 @@ impl<'input> Stream<'_, '_, 'input> {
         Some(Input::Mouse(mouse))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vt;
+
+    // Feeds `chunks` through a single pair of parsers (simulating a stream
+    // split across reads) and collects every `Input` produced.
+    fn parse_chunks<'i>(chunks: &[&'i str]) -> Vec<Input<'i>> {
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let mut inputs = Vec::new();
+
+        for chunk in chunks {
+            let vt_stream = vt_parser.parse(chunk);
+            inputs.extend(input_parser.parse(vt_stream));
+        }
+
+        inputs
+    }
+
+    fn expect_single_paste(inputs: Vec<Input<'_>>) -> Vec<u8> {
+        let mut pastes: Vec<_> = inputs
+            .into_iter()
+            .filter_map(|i| match i {
+                Input::Paste(buf) => Some(buf),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pastes.len(), 1, "expected exactly one Input::Paste");
+        pastes.pop().unwrap()
+    }
+
+    // A CSI sequence that isn't the `200~`/`201~` paste marker, embedded in
+    // the pasted text. It's 6 bytes long: `ESC [ 1 2 3 X`.
+    const FAKE_CSI: &str = "\x1b[123X";
+
+    // Regression test: `handle_bracketed_paste()` only extended its buffer
+    // up to the offset of the last *successfully parsed* token. If a chunk
+    // boundary landed mid-way through the fake CSI sequence above, the vt
+    // parser would consume those bytes while trying (and failing, for lack
+    // of more input) to complete the sequence, and then return `None` for
+    // this chunk. Those already-consumed bytes were never appended to the
+    // paste buffer and were gone by the time the next chunk arrived.
+    fn bracket_paste_split_inside_fake_csi(split: usize) {
+        assert!(split <= FAKE_CSI.len());
+        let chunk1 = format!("\x1b[200~AAA{}", &FAKE_CSI[..split]);
+        let chunk2 = format!("{}BBB\x1b[201~", &FAKE_CSI[split..]);
+        let inputs = parse_chunks(&[&chunk1, &chunk2]);
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, format!("AAA{FAKE_CSI}BBB").into_bytes());
+    }
+
+    #[test]
+    fn bracket_paste_split_before_fake_csi() {
+        bracket_paste_split_inside_fake_csi(0);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc() {
+        bracket_paste_split_inside_fake_csi(1);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_bracket() {
+        bracket_paste_split_inside_fake_csi(2);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_one() {
+        bracket_paste_split_inside_fake_csi(3);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_two() {
+        bracket_paste_split_inside_fake_csi(4);
+    }
+
+    #[test]
+    fn bracket_paste_split_before_final_byte() {
+        bracket_paste_split_inside_fake_csi(5);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_fake_csi() {
+        bracket_paste_split_inside_fake_csi(6);
+    }
+
+    // The paste terminator itself must still be recognized correctly (and
+    // not appended to the paste content) after the fix.
+    #[test]
+    fn bracket_paste_terminates_correctly() {
+        let inputs = parse_chunks(&["\x1b[200~hello\x1b[201~world"]);
+        assert!(inputs.iter().any(|i| matches!(i, Input::Text(s) if *s == "world")));
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, b"hello");
+    }
+}
