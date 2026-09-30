@@ -448,4 +448,38 @@ mod test {
             assert_eq!(line, 123); // Still on the same line
         }
     }
+
+    /// `LINES_BWD_DISPATCH` is resolved once, on first use, by an
+    /// unsynchronized write, and read on every call thereafter. If many
+    /// threads call `lines_bwd` for the first time at once, they race to
+    /// resolve and read that dispatch pointer concurrently.
+    ///
+    /// The assertions in this test will pass either way -- resolution
+    /// always converges on a valid function pointer for the process's CPU,
+    /// so the race by itself doesn't produce a wrong *result*. A plain
+    /// `cargo test` run of this is therefore not meaningful proof of
+    /// anything. What actually catches the bug is running it under Miri
+    /// (`cargo +nightly miri test`), which instruments every memory access
+    /// and reports "Undefined Behavior: Data race detected" at the
+    /// unsynchronized read/write sites on the unpatched code.
+    #[test]
+    fn dispatch_resolution_is_race_free() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const THREADS: usize = 200;
+        let barrier = Barrier::new(THREADS);
+
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let (off, line) = lines_bwd(b"Hello\nWorld\n", 11, 123, 456);
+                    assert_eq!(off, 6);
+                    assert_eq!(line, 123);
+                });
+            }
+        });
+    }
 }
