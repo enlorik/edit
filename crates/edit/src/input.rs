@@ -515,12 +515,17 @@ impl<'input> Stream<'_, '_, 'input> {
             return None;
         }
 
-        let b = (self.parser.x10_mouse_buf[0] as u16).saturating_sub(0x20);
+        let b = self.parser.x10_mouse_buf[0] as u16;
         let x = (self.parser.x10_mouse_buf[1] as u16).saturating_sub(0x20);
         let y = (self.parser.x10_mouse_buf[2] as u16).saturating_sub(0x20);
 
         self.parser.x10_mouse_want = false;
         self.parser.x10_mouse_len = 0;
+
+        if b < 0x20 {
+            return None;
+        }
+        let b = b - 0x20;
 
         Self::parse_xterm_mouse(&[b, x, y], 'M')
     }
@@ -604,8 +609,17 @@ mod tests {
         let mut input_parser = Parser::new();
         let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
 
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], Input::Mouse(_)));
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn x10_mouse_malformed_button_byte_is_not_misread_as_left_click() {
+        let input = "\x1b[M\0!\"";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 0);
     }
 
     #[test]
