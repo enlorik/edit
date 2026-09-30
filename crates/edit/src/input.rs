@@ -314,7 +314,18 @@ impl<'input> Iterator for Stream<'_, '_, 'input> {
             }
 
             if self.parser.x10_mouse_want {
-                return self.parse_x10_mouse_coordinates();
+                if let Some(input) = self.parse_x10_mouse_coordinates() {
+                    return Some(input);
+                }
+                if self.parser.x10_mouse_want {
+                    // Still waiting on more coordinate bytes than are
+                    // currently available; resume once more input arrives.
+                    return None;
+                }
+                // The X10 sequence was malformed and its state has already
+                // been reset; keep parsing the remaining stream instead of
+                // ending iteration early.
+                continue;
             }
 
             const KEYPAD_LUT: [u8; 8] = [
@@ -635,6 +646,20 @@ mod tests {
                 assert_eq!(mouse.position, Point { x: 0, y: 1 });
             }
             _ => panic!("expected Input::Mouse"),
+        }
+    }
+
+    #[test]
+    fn x10_mouse_malformed_sequence_does_not_drop_trailing_input() {
+        let input = "\x1b[M\0!!a";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Input::Text(text) => assert_eq!(text, "a"),
+            _ => panic!("expected Input::Text"),
         }
     }
 
