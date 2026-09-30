@@ -473,6 +473,7 @@ impl<'input> Stream<'_, '_, 'input> {
     fn handle_bracketed_paste(&mut self) -> Option<Input<'input>> {
         let beg = self.stream.offset();
         let mut end = beg;
+        let mut terminated = false;
 
         while let Some(token) = self.stream.next() {
             if let vt::Token::Csi(csi) = token
@@ -480,8 +481,18 @@ impl<'input> Stream<'_, '_, 'input> {
                 && csi.params[0] == 201
             {
                 self.parser.bracketed_paste = false;
+                terminated = true;
                 break;
             }
+            end = self.stream.offset();
+        }
+
+        // If we didn't find the terminator, `next()` returned `None` because
+        // the chunk ran out mid-sequence (e.g. mid-way through a CSI escape
+        // that isn't actually the paste terminator). Those bytes were
+        // already consumed from the stream, so we still need to buffer them
+        // here or they're lost for good once this chunk is dropped.
+        if !terminated {
             end = self.stream.offset();
         }
 
