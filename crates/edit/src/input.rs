@@ -527,18 +527,17 @@ impl<'input> Stream<'_, '_, 'input> {
         }
 
         let b = self.parser.x10_mouse_buf[0] as u16;
-        let x = (self.parser.x10_mouse_buf[1] as u16).saturating_sub(0x20);
-        let y = (self.parser.x10_mouse_buf[2] as u16).saturating_sub(0x20);
+        let x = self.parser.x10_mouse_buf[1] as u16;
+        let y = self.parser.x10_mouse_buf[2] as u16;
 
         self.parser.x10_mouse_want = false;
         self.parser.x10_mouse_len = 0;
 
-        if b < 0x20 {
+        if b < 0x20 || x < 0x20 || y < 0x20 {
             return None;
         }
-        let b = b - 0x20;
 
-        Self::parse_xterm_mouse(&[b, x, y], 'M')
+        Self::parse_xterm_mouse(&[b - 0x20, x - 0x20, y - 0x20], 'M')
     }
 
     fn parse_modifiers(csi: &vt::Csi) -> InputKeyMod {
@@ -664,18 +663,14 @@ mod tests {
     }
 
     #[test]
-    fn x10_mouse_nul_coordinates_clamp_to_zero() {
+    fn x10_mouse_nul_coordinate_bytes_are_rejected() {
         let input = "\x1b[M \0\0";
         let mut vt_parser = vt::Parser::new();
         let mut input_parser = Parser::new();
         let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
 
-        assert_eq!(events.len(), 1);
-        match events[0] {
-            Input::Mouse(mouse) => {
-                assert_eq!(mouse.position, Point { x: 0, y: 0 });
-            }
-            _ => panic!("expected Input::Mouse"),
-        }
+        // A NUL coordinate byte is below the X10 offset and must not be
+        // silently clamped into a real (0, 0) mouse press.
+        assert_eq!(events.len(), 0);
     }
 }
