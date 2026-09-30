@@ -594,9 +594,8 @@ impl<'input> Stream<'_, '_, 'input> {
 
 #[cfg(test)]
 mod tests {
-    use crate::vt;
-
     use super::*;
+    use crate::vt;
 
     #[test]
     fn x10_mouse_coordinates_below_offset_dont_panic() {
