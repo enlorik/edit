@@ -558,8 +558,8 @@ impl<'input> Stream<'_, '_, 'input> {
         };
 
         let kind = btn & !MODIFIERS;
-        let x = x as CoordType - 1;
-        let y = y as CoordType - 1;
+        let x = (x as CoordType - 1).max(0);
+        let y = (y as CoordType - 1).max(0);
         let mut mouse = InputMouse {
             state: InputMouseState::None,
             modifiers: kbmod::NONE,
@@ -633,6 +633,22 @@ mod tests {
         match events[0] {
             Input::Mouse(mouse) => {
                 assert_eq!(mouse.position, Point { x: 0, y: 1 });
+            }
+            _ => panic!("expected Input::Mouse"),
+        }
+    }
+
+    #[test]
+    fn x10_mouse_nul_coordinates_clamp_to_zero() {
+        let input = "\x1b[M \0\0";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Input::Mouse(mouse) => {
+                assert_eq!(mouse.position, Point { x: 0, y: 0 });
             }
             _ => panic!("expected Input::Mouse"),
         }
