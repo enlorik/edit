@@ -591,3 +591,41 @@ impl<'input> Stream<'_, '_, 'input> {
         Some(Input::Mouse(mouse))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::vt;
+
+    use super::*;
+
+    #[test]
+    fn x10_mouse_coordinates_below_offset_dont_panic() {
+        // `CSI M` followed by 3 bytes below 0x20 underflows the
+        // `as u16 - 0x20` subtraction in parse_x10_mouse_coordinates().
+        let input = "\x1b[M\0\0\0";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], Input::Mouse(_)));
+    }
+
+    #[test]
+    fn x10_mouse_coordinates_valid_bytes_unchanged() {
+        // Control case: all three bytes are within the valid >= 0x20 range,
+        // so the coordinates should decode exactly as before the fix.
+        let input = "\x1b[M !\"";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Input::Mouse(mouse) => {
+                assert_eq!(mouse.position, Point { x: 0, y: 1 });
+            }
+            _ => panic!("expected Input::Mouse"),
+        }
+    }
+}
