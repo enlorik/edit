@@ -269,6 +269,11 @@ pub enum Input<'input> {
 pub struct Parser {
     bracketed_paste: bool,
     bracketed_paste_buf: Vec<u8>,
+    // Bytes consumed by the vt parser while attempting (and running out of
+    // input for) a CSI sequence that might still turn out to be the `201~`
+    // paste terminator itself. Held back until the next chunk resolves
+    // whether they're real paste content or a terminator we shouldn't emit.
+    bracketed_paste_pending: Vec<u8>,
     x10_mouse_want: bool,
     x10_mouse_buf: [char; 3],
     x10_mouse_len: usize,
@@ -282,6 +287,7 @@ impl Parser {
         Self {
             bracketed_paste: false,
             bracketed_paste_buf: Vec::new(),
+            bracketed_paste_pending: Vec::new(),
             x10_mouse_want: false,
             x10_mouse_buf: ['\0'; 3],
             x10_mouse_len: 0,
@@ -473,6 +479,12 @@ impl<'input> Stream<'_, '_, 'input> {
     fn handle_bracketed_paste(&mut self) -> Option<Input<'input>> {
         let beg = self.stream.offset();
         let mut end = beg;
+        let mut terminated = false;
+        // Only the very first token of this call can be the resolution of a
+        // sequence carried over (and held in `bracketed_paste_pending`) from
+        // the end of a previous chunk - every later token in this loop is
+        // unambiguous and needs no special handling.
+        let mut first = true;
 
         while let Some(token) = self.stream.next() {
             if let vt::Token::Csi(csi) = token
@@ -480,8 +492,19 @@ impl<'input> Stream<'_, '_, 'input> {
                 && csi.params[0] == 201
             {
                 self.parser.bracketed_paste = false;
+                terminated = true;
+                if first {
+                    // Whatever we were holding back turned out to be (the
+                    // start of) the terminator itself, not paste content -
+                    // discard it instead of emitting it.
+                    self.parser.bracketed_paste_pending.clear();
+                }
                 break;
             }
+            if first && !self.parser.bracketed_paste_pending.is_empty() {
+                self.parser.bracketed_paste_buf.append(&mut self.parser.bracketed_paste_pending);
+            }
+            first = false;
             end = self.stream.offset();
         }
 
@@ -489,6 +512,21 @@ impl<'input> Stream<'_, '_, 'input> {
             self.parser
                 .bracketed_paste_buf
                 .extend_from_slice(&self.stream.input().as_bytes()[beg..end]);
+        }
+
+        // If we didn't find the terminator, `next()` returned `None`. If
+        // that happened because the chunk ran out mid-sequence, those bytes
+        // were already consumed from the stream, but we don't yet know if
+        // they're real paste content or the start of the real terminator
+        // (which may only complete once the next chunk arrives) - so hold
+        // them back instead of emitting them here.
+        if !terminated {
+            let cur = self.stream.offset();
+            if cur != end {
+                self.parser
+                    .bracketed_paste_pending
+                    .extend_from_slice(&self.stream.input().as_bytes()[end..cur]);
+            }
         }
 
         if !self.parser.bracketed_paste {
@@ -589,5 +627,140 @@ impl<'input> Stream<'_, '_, 'input> {
         mouse.modifiers |= if (btn & CTRL) != 0 { kbmod::CTRL } else { kbmod::NONE };
 
         Some(Input::Mouse(mouse))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vt;
+
+    // Feeds `chunks` through a single pair of parsers (simulating a stream
+    // split across reads) and collects every `Input` produced.
+    fn parse_chunks<'i>(chunks: &[&'i str]) -> Vec<Input<'i>> {
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let mut inputs = Vec::new();
+
+        for chunk in chunks {
+            let vt_stream = vt_parser.parse(chunk);
+            inputs.extend(input_parser.parse(vt_stream));
+        }
+
+        inputs
+    }
+
+    fn expect_single_paste(inputs: Vec<Input<'_>>) -> Vec<u8> {
+        let mut pastes: Vec<_> = inputs
+            .into_iter()
+            .filter_map(|i| match i {
+                Input::Paste(buf) => Some(buf),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pastes.len(), 1, "expected exactly one Input::Paste");
+        pastes.pop().unwrap()
+    }
+
+    // A CSI sequence that isn't the `200~`/`201~` paste marker, embedded in
+    // the pasted text. It's 6 bytes long: `ESC [ 1 2 3 X`.
+    const FAKE_CSI: &str = "\x1b[123X";
+
+    // Regression test: `handle_bracketed_paste()` only extended its buffer
+    // up to the offset of the last *successfully parsed* token. If a chunk
+    // boundary landed mid-way through the fake CSI sequence above, the vt
+    // parser would consume those bytes while trying (and failing, for lack
+    // of more input) to complete the sequence, and then return `None` for
+    // this chunk. Those already-consumed bytes were never appended to the
+    // paste buffer and were gone by the time the next chunk arrived.
+    fn bracket_paste_split_inside_fake_csi(split: usize) {
+        assert!(split <= FAKE_CSI.len());
+        let chunk1 = format!("\x1b[200~AAA{}", &FAKE_CSI[..split]);
+        let chunk2 = format!("{}BBB\x1b[201~", &FAKE_CSI[split..]);
+        let inputs = parse_chunks(&[&chunk1, &chunk2]);
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, format!("AAA{FAKE_CSI}BBB").into_bytes());
+    }
+
+    #[test]
+    fn bracket_paste_split_before_fake_csi() {
+        bracket_paste_split_inside_fake_csi(0);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc() {
+        bracket_paste_split_inside_fake_csi(1);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_bracket() {
+        bracket_paste_split_inside_fake_csi(2);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_one() {
+        bracket_paste_split_inside_fake_csi(3);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_two() {
+        bracket_paste_split_inside_fake_csi(4);
+    }
+
+    #[test]
+    fn bracket_paste_split_before_final_byte() {
+        bracket_paste_split_inside_fake_csi(5);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_fake_csi() {
+        bracket_paste_split_inside_fake_csi(6);
+    }
+
+    // The paste terminator itself must still be recognized correctly (and
+    // not appended to the paste content) after the fix.
+    #[test]
+    fn bracket_paste_terminates_correctly() {
+        let inputs = parse_chunks(&["\x1b[200~hello\x1b[201~world"]);
+        assert!(inputs.iter().any(|i| matches!(i, Input::Text(s) if *s == "world")));
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, b"hello");
+    }
+
+    // Regression test: the fix for the fake-CSI byte loss above must not
+    // start emitting bytes it consumed while speculatively parsing a CSI
+    // sequence that then turns out to *be* the real `201~` terminator. If a
+    // chunk boundary lands inside the terminator itself, the prefix consumed
+    // before the split must not leak into the paste content.
+    const TERMINATOR: &str = "\x1b[201~";
+
+    fn bracket_paste_split_inside_terminator(split: usize) {
+        assert!(split <= TERMINATOR.len());
+        let chunk1 = format!("\x1b[200~hello{}", &TERMINATOR[..split]);
+        let chunk2 = format!("{}world", &TERMINATOR[split..]);
+        let inputs = parse_chunks(&[&chunk1, &chunk2]);
+        assert!(inputs.iter().any(|i| matches!(i, Input::Text(s) if *s == "world")));
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, b"hello");
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_before_terminator() {
+        bracket_paste_split_inside_terminator(1);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_bracket_before_terminator() {
+        bracket_paste_split_inside_terminator(2);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_before_terminator() {
+        bracket_paste_split_inside_terminator(4);
+    }
+
+    #[test]
+    fn bracket_paste_split_before_terminator_final_byte() {
+        bracket_paste_split_inside_terminator(5);
     }
 }
