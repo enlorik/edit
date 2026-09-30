@@ -269,6 +269,11 @@ pub enum Input<'input> {
 pub struct Parser {
     bracketed_paste: bool,
     bracketed_paste_buf: Vec<u8>,
+    // Bytes consumed by the vt parser while attempting (and running out of
+    // input for) a CSI sequence that might still turn out to be the `201~`
+    // paste terminator itself. Held back until the next chunk resolves
+    // whether they're real paste content or a terminator we shouldn't emit.
+    bracketed_paste_pending: Vec<u8>,
     x10_mouse_want: bool,
     x10_mouse_buf: [char; 3],
     x10_mouse_len: usize,
@@ -282,6 +287,7 @@ impl Parser {
         Self {
             bracketed_paste: false,
             bracketed_paste_buf: Vec::new(),
+            bracketed_paste_pending: Vec::new(),
             x10_mouse_want: false,
             x10_mouse_buf: ['\0'; 3],
             x10_mouse_len: 0,
@@ -474,6 +480,11 @@ impl<'input> Stream<'_, '_, 'input> {
         let beg = self.stream.offset();
         let mut end = beg;
         let mut terminated = false;
+        // Only the very first token of this call can be the resolution of a
+        // sequence carried over (and held in `bracketed_paste_pending`) from
+        // the end of a previous chunk - every later token in this loop is
+        // unambiguous and needs no special handling.
+        let mut first = true;
 
         while let Some(token) = self.stream.next() {
             if let vt::Token::Csi(csi) = token
@@ -482,17 +493,18 @@ impl<'input> Stream<'_, '_, 'input> {
             {
                 self.parser.bracketed_paste = false;
                 terminated = true;
+                if first {
+                    // Whatever we were holding back turned out to be (the
+                    // start of) the terminator itself, not paste content -
+                    // discard it instead of emitting it.
+                    self.parser.bracketed_paste_pending.clear();
+                }
                 break;
             }
-            end = self.stream.offset();
-        }
-
-        // If we didn't find the terminator, `next()` returned `None` because
-        // the chunk ran out mid-sequence (e.g. mid-way through a CSI escape
-        // that isn't actually the paste terminator). Those bytes were
-        // already consumed from the stream, so we still need to buffer them
-        // here or they're lost for good once this chunk is dropped.
-        if !terminated {
+            if first && !self.parser.bracketed_paste_pending.is_empty() {
+                self.parser.bracketed_paste_buf.append(&mut self.parser.bracketed_paste_pending);
+            }
+            first = false;
             end = self.stream.offset();
         }
 
@@ -500,6 +512,21 @@ impl<'input> Stream<'_, '_, 'input> {
             self.parser
                 .bracketed_paste_buf
                 .extend_from_slice(&self.stream.input().as_bytes()[beg..end]);
+        }
+
+        // If we didn't find the terminator, `next()` returned `None`. If
+        // that happened because the chunk ran out mid-sequence, those bytes
+        // were already consumed from the stream, but we don't yet know if
+        // they're real paste content or the start of the real terminator
+        // (which may only complete once the next chunk arrives) - so hold
+        // them back instead of emitting them here.
+        if !terminated {
+            let cur = self.stream.offset();
+            if cur != end {
+                self.parser
+                    .bracketed_paste_pending
+                    .extend_from_slice(&self.stream.input().as_bytes()[end..cur]);
+            }
         }
 
         if !self.parser.bracketed_paste {
@@ -698,5 +725,42 @@ mod tests {
         assert!(inputs.iter().any(|i| matches!(i, Input::Text(s) if *s == "world")));
         let paste = expect_single_paste(inputs);
         assert_eq!(paste, b"hello");
+    }
+
+    // Regression test: the fix for the fake-CSI byte loss above must not
+    // start emitting bytes it consumed while speculatively parsing a CSI
+    // sequence that then turns out to *be* the real `201~` terminator. If a
+    // chunk boundary lands inside the terminator itself, the prefix consumed
+    // before the split must not leak into the paste content.
+    const TERMINATOR: &str = "\x1b[201~";
+
+    fn bracket_paste_split_inside_terminator(split: usize) {
+        assert!(split <= TERMINATOR.len());
+        let chunk1 = format!("\x1b[200~hello{}", &TERMINATOR[..split]);
+        let chunk2 = format!("{}world", &TERMINATOR[split..]);
+        let inputs = parse_chunks(&[&chunk1, &chunk2]);
+        assert!(inputs.iter().any(|i| matches!(i, Input::Text(s) if *s == "world")));
+        let paste = expect_single_paste(inputs);
+        assert_eq!(paste, b"hello");
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_before_terminator() {
+        bracket_paste_split_inside_terminator(1);
+    }
+
+    #[test]
+    fn bracket_paste_split_after_esc_bracket_before_terminator() {
+        bracket_paste_split_inside_terminator(2);
+    }
+
+    #[test]
+    fn bracket_paste_split_mid_digit_before_terminator() {
+        bracket_paste_split_inside_terminator(4);
+    }
+
+    #[test]
+    fn bracket_paste_split_before_terminator_final_byte() {
+        bracket_paste_split_inside_terminator(5);
     }
 }
