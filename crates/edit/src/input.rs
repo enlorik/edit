@@ -314,7 +314,18 @@ impl<'input> Iterator for Stream<'_, '_, 'input> {
             }
 
             if self.parser.x10_mouse_want {
-                return self.parse_x10_mouse_coordinates();
+                if let Some(input) = self.parse_x10_mouse_coordinates() {
+                    return Some(input);
+                }
+                if self.parser.x10_mouse_want {
+                    // Still waiting on more coordinate bytes than are
+                    // currently available; resume once more input arrives.
+                    return None;
+                }
+                // The X10 sequence was malformed and its state has already
+                // been reset; keep parsing the remaining stream instead of
+                // ending iteration early.
+                continue;
             }
 
             const KEYPAD_LUT: [u8; 8] = [
@@ -515,14 +526,18 @@ impl<'input> Stream<'_, '_, 'input> {
             return None;
         }
 
-        let b = self.parser.x10_mouse_buf[0] as u16 - 0x20;
-        let x = self.parser.x10_mouse_buf[1] as u16 - 0x20;
-        let y = self.parser.x10_mouse_buf[2] as u16 - 0x20;
+        let b = self.parser.x10_mouse_buf[0] as u16;
+        let x = self.parser.x10_mouse_buf[1] as u16;
+        let y = self.parser.x10_mouse_buf[2] as u16;
 
         self.parser.x10_mouse_want = false;
         self.parser.x10_mouse_len = 0;
 
-        Self::parse_xterm_mouse(&[b, x, y], 'M')
+        if b < 0x20 || x < 0x20 || y < 0x20 {
+            return None;
+        }
+
+        Self::parse_xterm_mouse(&[b - 0x20, x - 0x20, y - 0x20], 'M')
     }
 
     fn parse_modifiers(csi: &vt::Csi) -> InputKeyMod {
@@ -553,8 +568,8 @@ impl<'input> Stream<'_, '_, 'input> {
         };
 
         let kind = btn & !MODIFIERS;
-        let x = x as CoordType - 1;
-        let y = y as CoordType - 1;
+        let x = (x as CoordType - 1).max(0);
+        let y = (y as CoordType - 1).max(0);
         let mut mouse = InputMouse {
             state: InputMouseState::None,
             modifiers: kbmod::NONE,
@@ -589,5 +604,73 @@ impl<'input> Stream<'_, '_, 'input> {
         mouse.modifiers |= if (btn & CTRL) != 0 { kbmod::CTRL } else { kbmod::NONE };
 
         Some(Input::Mouse(mouse))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vt;
+
+    #[test]
+    fn x10_mouse_coordinates_below_offset_dont_panic() {
+        let input = "\x1b[M\0\0\0";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn x10_mouse_malformed_button_byte_is_not_misread_as_left_click() {
+        let input = "\x1b[M\0!\"";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 0);
+    }
+
+    #[test]
+    fn x10_mouse_coordinates_valid_bytes_unchanged() {
+        let input = "\x1b[M !\"";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Input::Mouse(mouse) => {
+                assert_eq!(mouse.position, Point { x: 0, y: 1 });
+            }
+            _ => panic!("expected Input::Mouse"),
+        }
+    }
+
+    #[test]
+    fn x10_mouse_malformed_sequence_does_not_drop_trailing_input() {
+        let input = "\x1b[M\0!!a";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        assert_eq!(events.len(), 1);
+        match events[0] {
+            Input::Text(text) => assert_eq!(text, "a"),
+            _ => panic!("expected Input::Text"),
+        }
+    }
+
+    #[test]
+    fn x10_mouse_nul_coordinate_bytes_are_rejected() {
+        let input = "\x1b[M \0\0";
+        let mut vt_parser = vt::Parser::new();
+        let mut input_parser = Parser::new();
+        let events: Vec<_> = input_parser.parse(vt_parser.parse(input)).collect();
+
+        // A NUL coordinate byte is below the X10 offset and must not be
+        // silently clamped into a real (0, 0) mouse press.
+        assert_eq!(events.len(), 0);
     }
 }
